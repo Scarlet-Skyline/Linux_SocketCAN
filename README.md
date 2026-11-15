@@ -6,6 +6,7 @@
 上游来源：Linux 内核源码 drivers/net/can/usb/gs_usb.c 及经典开源固件 candleLight_fw。
 
 $\color{red}{\text{关于candleLight_fw的理解}}$
+
 一个标准的 USB-CAN 分析仪固件（与拓展1/2里用到的DMTool分析仪起到一样的作用）
 将 MCU CAN 总线的数据转化为主机能明白的协议。
 市面上买到的分析仪要求遵守厂家规定的私有协议并且使用对应的上位机软件来解析（DMTool）
@@ -23,6 +24,7 @@ GS_USB_BREQ_MODE (2)：处理 GS_CAN_MODE_START（启动）与 GS_CAN_MODE_RESET
 GS_USB_BREQ_DEVICE_CONFIG (5) 与 GS_USB_BREQ_HOST_FORMAT (0)：基础设备与格式配置。
 
 $\color{red}{\text{关于“请求”的理解}}$
+
 在 USB 通信中，数据传输分为两种：一种是传数据（e.g. CAN 帧通过 Bulk 端点发送），另一种是发指令/问问题。后者就是通过控制端点（EP0）发送的“请求”。请求一般在终端敲下加载驱动命令后开始，起到配置设备的作用。（设备不响应的话，系统驱动会认为这是个坏设备）
 
 GS_USB_BREQ_BT_CONST：在加载驱动的时候。Linux 需要知道你的 STM32 的 FDCAN 内核时钟是多少（比如 80MHz），以及你支持的最大最小分频系数（BRP）、时间段长度（TSEG1/2）等。拿到这些参数，Linux 才能计算出 1Mbps、500kbps 等波特率对应的寄存器值。
@@ -31,8 +33,7 @@ GS_USB_BREQ_BITTIMING：在终端敲下 ip link set can0 up type can bitrate 100
 
 GS_USB_BREQ_MODE：敲下 ip link set can0 up（启动）或者 ip link set can0 down（停止）的时候。开关作用。
              GS_CAN_MODE_START：告诉设备打开 CAN 控制器。
-
-             GS_CAN_MODE_RESET：告诉设备关闭网卡了，请把 CAN 控制器停掉。
+             GS_CAN_MODE_START：告诉设备关闭网卡，把 CAN 控制器停掉。
 
 GS_USB_BREQ_DEVICE_CONFIG（设备->主机）、GS_USB_BREQ_HOST_FORMAT（主机->设备）：
             前者：支持几个CAN通道，固件版本是多少？此作业中只有can0
@@ -51,12 +52,14 @@ usb_rx_task 从 EP2 OUT 读取原始字节流，按 #[repr(C)] 映射为 GsHostF
 can_tx_task 取出并构造 FdFrame 写入 FDCAN TX 邮箱。发送成功后，将原帧放回 ECHO_CHANNEL 触发 USB 回显。
 
 $\color{red}{\text{关于收发时GsHostFrame结构体形式}}$
+
 Linux 和 STM32 之间必须约定一个“打包格式”，才能知道这一串字节里，哪几个代表 ID，哪几个代表数据。
 在拓展1/2中，用的是私有格式（比如文本字符串 CAN TX 123 55AA）。这就像你和你朋友私下写信，随便约定格式。
 
 但在任务3中，面对的是 Linux 内核。Linux 不会去解析我自己的中文或英文字符串，它只认 gs_usb 官方规定的二进制格式——也就是 GsHostFrame。相当于一个接收发送标准。
 
 $\color{red}{\text{为什么要“回显”？}}$
+
 CAN 总线发送是不保证绝对成功的。 比如总线上如果有另一个设备同时发数据，就会发生“总线仲裁冲突”，这时候数据发送就失败了。
 
 当让 Linux 发一帧数据到 can0 时，Linux 会给发一个 GsHostFrame结构体，并在 echo_id 里填一个唯一的流水号（比如 0x01）。
@@ -96,22 +99,27 @@ FDCAN 底层配置：保留了拓展 2 的 FDCAN 初始化配置（1 Mbit/s 仲�
 在 Linux 主机上无需安装额外驱动，内核自带 gs_usb 模块。设备插入后执行：
 
 # 1. 加载驱动并查看接口
+
 sudo modprobe gs_usb
 ip -brief link show type can
-# 预期输出: can0  DOWN  <NOARP,ECHO>
+预期输出: can0  DOWN  <NOARP,ECHO>
 
 # 2. 启动 CAN 接口 (Classical CAN 1Mbit/s)
+
 sudo ip link set can0 up type can bitrate 1000000
 
 # 3. 接收测试 (另开终端)
+
 candump can0
 
 # 4. 发送测试
+
 cansend can0 123#1122334455667788
 
 预期行为：执行 cansend 后，由于 echo_id 回显机制，candump 窗口会立刻收到自己发送的这帧数据 can0 123 [8] 11 22 33 44 55 66 77 88。若外部总线上有其它节点发送数据，candump 也能同步接收显示。
 
 $\color{red}{\text{与拓展1、拓展2 CAN测试的不同？}}$
+
 首先分析仪不同及其使用的协议不同，前面提到过（私有、共有）
 硬件连接、收发操作查看方式会不同。
 
