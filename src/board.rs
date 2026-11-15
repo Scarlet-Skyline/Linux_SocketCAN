@@ -86,7 +86,7 @@ pub fn can1(
     // 2. 数据段 (Data Phase)：5 Mbit/s, 采样点 ~81.25%
     // 时钟 80MHz，prescaler=1，Tq=12.5ns。5Mbps = 200ns = 16 Tq。
     // 采样点 (1 + 12) / 16 = 81.25%
-    let data_timing = DataBitTiming {
+    let _data_timing = DataBitTiming {
         prescaler: NonZeroU16::new(1).unwrap(),
         seg1: NonZeroU8::new(12).unwrap(),
         seg2: NonZeroU8::new(3).unwrap(),

@@ -1,97 +1,139 @@
-拓展任务二：5 Mbit/s CAN FD 与 TDC 实现说明
+拓展任务三：Linux SocketCAN 支持，以及Linux系统下USB协议的调整
 
-在要求高速传输数据的情况下，classical CAN 难以处理，换用 FD CAN 总线处理。启用BRS（Bit Rate Switch, 位速率切换）来调传输速度，TDC（Transmitter Delay Compensation，发送器延迟补偿）来负责在高速数据段（5 Mbit/s）中，保证发送节点能正确“监听到”自己发出的数据，防止误报错并导致总线崩溃。
+一、 兼容协议说明
+所选协议与驱动：gs_usb（Linux 内核标准 CAN over USB 协议，内置 gs_usb 驱动）。
 
-#具体原理：CAN 协议要求发送节点必须一边发数据，一边通过收发器（TX 到 RX 引脚）回读总线上的电平，确认自己发出去的位没有被别人篡改。但在 5 Mbit/s 的高速下，位时间极短（200ns），而信号穿过收发器芯片是有物理延迟的（可能高达 100ns）。如果发送节点还在原来的时间点去采样，读到的可能还是上一个位的电平，就会误以为发生了“位错误（Bit Error）”。
-TDC 的作用就是计算出这个物理延迟，并在数据段重新定义一个二次采样点（SSP）。发送节点不按原计划时间采样了，而是往后推迟一点，等信号从收发器绕一圈回来了，再在 SSP 点去采样，这样就绝不会读错了。
+上游来源：Linux 内核源码 drivers/net/can/usb/gs_usb.c 及经典开源固件 candleLight_fw。
 
+$\color{red}{\text{关于candleLight_fw的理解}}$
+一个标准的 USB-CAN 分析仪固件（与拓展1/2里用到的DMTool分析仪起到一样的作用）
+将 MCU CAN 总线的数据转化为主机能明白的协议。
+市面上买到的分析仪要求遵守厂家规定的私有协议并且使用对应的上位机软件来解析（DMTool）
+但是使用candleLight_fw固件，遵循的是Linux内核中写好的、公开的标准协议，方便省钱
+ （不仅不用购买还能直接在linux终端通过命令操控查看收发）
 
-一、 总体说明（入口与数据路径）
-代码入口：程序入口位于 src/main.rs 的 main 函数。该函数初始化了时钟、外设，并启动了多个并发的异步任务。
+已实现的请求（在 src/main.rs 的 control_out / control_in 中处理）：
 
-数据路径：
+GS_USB_BREQ_BT_CONST (4)：主机查询设备位时序能力参数（返回 80MHz 内核时钟范围）。
 
-接收（CAN → 主机）：can_rx_task 通过中断读取 FDCAN1 的 FD 帧，放入容量为 8 的 CAN_RX_CHANNEL 队列。control_port 任务从队列取出数据，通过 protocol.rs 格式化为十六进制字符串，经 USB CDC 发送给主机。
+GS_USB_BREQ_BITTIMING (1)：主机下发位时序参数（存入全局原子变量）。
 
-发送（主机 → CAN）：主机通过 USB 发送文本指令，control_port 解析后放入容量为 4 的 CAN_TX_CHANNEL 队列。can_tx_task 取出 FD 帧并调用 FDCAN 驱动发送到总线上。
+GS_USB_BREQ_MODE (2)：处理 GS_CAN_MODE_START（启动）与 GS_CAN_MODE_RESET（复位）指令。
 
-并发与缓冲：基于 Embassy 异步框架。使用 Channel 实现任务间通信。当 CAN_RX_CHANNEL 满时，丢弃最新帧以保证接收任务不阻塞；当 CAN_TX_CHANNEL 满时，向主机返回 ERR BUSY。protocol.rs 中的解析缓冲区已扩大至 256 字节，足以容纳 64 字节（128 hex 字符）载荷转换后的长字符串。
+GS_USB_BREQ_DEVICE_CONFIG (5) 与 GS_USB_BREQ_HOST_FORMAT (0)：基础设备与格式配置。
 
-关键配置：board.rs 中配置了 FDCAN1 的仲裁段和数据段时序，启用了 BRS 和 TDC，并设置为 AllowFdCanAndBRS （比如classical CAN用 classicalOnly即可） 模式。
+$\color{red}{\text{关于“请求”的理解}}$
+在 USB 通信中，数据传输分为两种：一种是传数据（e.g. CAN 帧通过 Bulk 端点发送），另一种是发指令/问问题。后者就是通过控制端点（EP0）发送的“请求”。请求一般在终端敲下加载驱动命令后开始，起到配置设备的作用。（设备不响应的话，系统驱动会认为这是个坏设备）
 
-二、位时序/采样点计算，TDC配置，FD帧处理和协议格式
+GS_USB_BREQ_BT_CONST：在加载驱动的时候。Linux 需要知道你的 STM32 的 FDCAN 内核时钟是多少（比如 80MHz），以及你支持的最大最小分频系数（BRP）、时间段长度（TSEG1/2）等。拿到这些参数，Linux 才能计算出 1Mbps、500kbps 等波特率对应的寄存器值。
 
-1. 位时序参数计算
+GS_USB_BREQ_BITTIMING：在终端敲下 ip link set can0 up type can bitrate 1000000 的时候。Linux 根据上一步得到的参数，算好了 1Mbps 对应的具体参数（brp=1, prop_seg, phase_seg1/2 等），把这一包参数塞给设备，意思是：“按这个参数去配置你的 FDCAN 寄存器”。
 
-FDCAN 内核时钟（fdcansel 选择 PLL2_Q）为 80 MHz。
-时间量子 Tq=1/80 MHz = 12.5ns 
+GS_USB_BREQ_MODE：敲下 ip link set can0 up（启动）或者 ip link set can0 down（停止）的时候。开关作用。
+             GS_CAN_MODE_START：告诉设备打开 CAN 控制器。
 
-仲裁段（1 Mbit/s）：
+             GS_CAN_MODE_RESET：告诉设备关闭网卡了，请把 CAN 控制器停掉。
 
-目标位时间 = 1/1 Mbit/s = 1000ns = 80Tq
-
-参数：prescaler = 1，TSEG1 (seg1) = 59，TSEG2 (seg2) = 20，SJW = 20。
-
-##
-位时序（Bit Timing）定义了CAN总线上一个位（Bit）的时间长度是如何划分的，它决定了通信的波特率和采样点位置。一个位时间被划分为多个时间量子（Tq），通常包含以下几个段：
-
-同步段（Sync_Seg）：用于同步总线上的各个节点，固定为1个Tq。
-
-传播段（Prop_Seg）：用于补偿信号在总线上的物理传播延迟。
-
-相位缓冲段1（Phase_Seg1） 和 相位缓冲段2（Phase_Seg2）：用于补偿节点间的时钟误差。
-
-采样点（Sample Point）：位于Phase_Seg1结束处，是节点读取总线电平的时刻。
-
-同步跳转宽度（SJW）：定义了在一次同步中，位时间可以被延长或缩短的最大Tq数。
-
-在配置寄存器时，Prop_Seg和Phase_Seg1通常被合并称为TSEG1，Phase_Seg2被称为TSEG2。采样点位置的计算公式为：
-
-Sample Point (%) = (Sync_Seg + TSEG1) / (Sync_Seg + TSEG1 + TSEG2) × 100%。
-##
-
-所以仲裁段采样点计算：
-(1+59)/80=75%
+GS_USB_BREQ_DEVICE_CONFIG（设备->主机）、GS_USB_BREQ_HOST_FORMAT（主机->设备）：
+            前者：支持几个CAN通道，固件版本是多少？此作业中只有can0
+            后者：主机告诉设备，发出的结构体是大端还是小端
 
 
-数据段（5 Mbit/s）：
 
-目标位时间 = 1/5 Mbit/s = 200 ns =16Tq
+二， 数据路径与帧转换
+本实现替换了原有的 CMSIS-DAP 与 CDC 串口功能，将 USB 枚举为单 Vendor 接口（VID: 0x1d50, PID: 0x606f），配置 EP1 IN（设备向主机发送）和 EP2 OUT（主机向设备发送）两个批量端点。
+
+主机到 CAN（发送路径）：
+
+usb_rx_task 从 EP2 OUT 读取原始字节流，按 #[repr(C)] 映射为 GsHostFrame（20字节结构体）。
+提取 can_id、can_dlc 和 data[8]，过滤扩展帧。（candleLight_fw的功劳）
+放入 CAN_TX_CHANNEL 有界队列。
+can_tx_task 取出并构造 FdFrame 写入 FDCAN TX 邮箱。发送成功后，将原帧放回 ECHO_CHANNEL 触发 USB 回显。
+
+$\color{red}{\text{关于收发时GsHostFrame结构体形式}}$
+Linux 和 STM32 之间必须约定一个“打包格式”，才能知道这一串字节里，哪几个代表 ID，哪几个代表数据。
+在拓展1/2中，用的是私有格式（比如文本字符串 CAN TX 123 55AA）。这就像你和你朋友私下写信，随便约定格式。
+
+但在任务3中，面对的是 Linux 内核。Linux 不会去解析我自己的中文或英文字符串，它只认 gs_usb 官方规定的二进制格式——也就是 GsHostFrame。相当于一个接收发送标准。
+
+$\color{red}{\text{为什么要“回显”？}}$
+CAN 总线发送是不保证绝对成功的。 比如总线上如果有另一个设备同时发数据，就会发生“总线仲裁冲突”，这时候数据发送就失败了。
+
+当让 Linux 发一帧数据到 can0 时，Linux 会给发一个 GsHostFrame结构体，并在 echo_id 里填一个唯一的流水号（比如 0x01）。
+
+STM32 把这帧数据通过 FDCAN 扔到总线上。如果硬件发送成功，代码必须把刚才那个 GsHostFrame 原封不动（保留流水号 0x01）再通过 USB 传回给 Linux。
+
+Linux 收到回传后，看到流水号是 0x01，就会在系统里标记：“哦！刚才那帧数据真的成功发到物理总线上了！” 然后它才会把这一帧显示在 candump 里。
+
+如果没有回显，Linux 不知道数据到底发成功了没，干等超时。所以，回显就是 gs_usb 协议里的“发送成功确认（ACK）”。
 
 
-参数：prescaler = 1，TSEG1 (seg1) = 12，TSEG2 (seg2) = 3，SJW = 3。
+CAN 到主机（接收路径）：
 
-采样点计算：
-(1+12)/16=81.25%
+can_rx_task 从 FDCAN RX 中断读取数据。
+解析出标准 ID 和载荷，填入 GsHostFrame（echo_id 设为 0xFFFFFFFF）。
+放入 CAN_RX_CHANNEL 有界队列。
+usb_tx_task 从队列取出，序列化为字节流通过 EP1 IN 发往 Linux。
 
 
-2. TDC（发送延迟补偿）配置
+三、 并发与缓冲处理
+任务组织：基于 Embassy 异步运行时，拆分为 usb_rx_task、usb_tx_task、can_rx_task、can_tx_task，通过 embassy_futures::select 和 join 组合并发执行，互不阻塞。
 
-单位与设置：在代码中，通过设置 transceiver_delay_compensation: true 启用了 TDC。
+队列与溢出处理：使用容量为 4 或 8 的 Channel 作为有界缓冲。所有队列写入均使用 try_send（非阻塞）。若队列已满（例如 USB 主机读取缓慢或 CAN 总线拥塞），直接丢弃新帧/旧帧，避免任务挂起。
 
-！！！关于 TDCO/TDCF 的说明：由于当前工程依赖的 embassy-stm32 = 0.6.0 版本 API 限制，DataBitTiming 结构体中未暴露 tdc_offset (TDCO，TDC偏移量，可用于配置SSP最终位置) 和 tdc_filter_window_length (TDCF，可以设定SSP最小位置，避免过早采样采到噪声) 字段。在当前配置下，硬件将使用默认参数或自动测量环路延迟来计算 SSP 位置。（board.rs中把这两行注释掉了，不然编译过不了）
+发送回显：echo_id 机制完整保留，主机发送的帧在 CAN 物理层发送成功后，原封不动通过 EP1 IN 回传，供 Linux 驱动确认发送完成。
 
-注意：跑起来应该没问题，但是如果发现高速数据段通信不稳定，可能需要升级库版本以手动微调 TDCO/TDCF。
 
-3. FD 帧处理与协议格式
-帧格式：使用 FdFrame 类型替代原经典 CAN 的 Frame。通过 FrameTransmissionConfig::AllowFdCanAndBRS 允许发送 FD 帧并开启 BRS（位速率切换）。（board.rs中启用的）
+四、 关键配置与预期行为
 
-主机协议边界：采用文本协议，以换行符 \n 作为帧边界。
+Classical CAN 支持：本项目按要求实现基础范围的 Classical CAN 标准数据帧，载荷限制为 0-8 字节（GsHostFrame.data 为 [u8; 8]）。
 
-发送示例：CAN TX 123 112233445566778899AABBCC（ID: 0x123，载荷为 12 字节）。
+FDCAN 底层配置：保留了拓展 2 的 FDCAN 初始化配置（1 Mbit/s 仲裁段，5 Mbit/s 数据段，启用 TDC）。可供后续启用CAN FD使用
 
-接收示例：RX 123 112233445566778899AABBCC。
 
-在所使用的DMTool的上位机软件中，分别选择串口/CAN窗口可进行发送。仲裁段/数据段的波特率配置也可以在“设备配置中进行配置”。
+五、 Linux 主机使用方法与验证
 
-长载荷处理：DLC（数据长度码）由硬件根据写入的字节数自动推断。protocol.rs 中的 Line 解析器将缓冲区增大到 256 字节，并将允许的十六进制字符长度上限从 16 提升至 128，确保 64 字节（128个 hex 字符）的载荷能够被完整解析并送入 FdFrame。
+在 Linux 主机上无需安装额外驱动，内核自带 gs_usb 模块。设备插入后执行：
 
-三、 上板验证预期
-当前硬件行为均为预期设计，尚未上板验证。 编译成功证明代码具备生成固件的能力。后续上板时，需要保证DMTool满足以下条件：
+# 1. 加载驱动并查看接口
+sudo modprobe gs_usb
+ip -brief link show type can
+# 预期输出: can0  DOWN  <NOARP,ECHO>
 
-匹配 1 Mbit/s 仲裁段和 5 Mbit/s 数据段的位时序。
+# 2. 启动 CAN 接口 (Classical CAN 1Mbit/s)
+sudo ip link set can0 up type can bitrate 1000000
 
-开启 CAN FD 和 BRS 支持。
+# 3. 接收测试 (另开终端)
+candump can0
 
-保证物理总线（CAN_H/CAN_L）终端电阻匹配，且收发器支持 5 Mbps 速率。
+# 4. 发送测试
+cansend can0 123#1122334455667788
 
+预期行为：执行 cansend 后，由于 echo_id 回显机制，candump 窗口会立刻收到自己发送的这帧数据 can0 123 [8] 11 22 33 44 55 66 77 88。若外部总线上有其它节点发送数据，candump 也能同步接收显示。
+
+$\color{red}{\text{与拓展1、拓展2 CAN测试的不同？}}$
+首先分析仪不同及其使用的协议不同，前面提到过（私有、共有）
+硬件连接、收发操作查看方式会不同。
+
+硬件连接：1、虚拟机（以VM为例）
+
+            插上板子，Windows 会尝试去认它（可能会弹窗提示“无法识别的设备”或要求安装驱动）。必须先阻止 Windows 认领它
+            在虚拟机菜单栏找 虚拟机 (VM) -> 可移动设备 (Removable Devices)。
+            找到 USB 设备（可能叫 Unknown Device，或者如果 VID/PID 识别了会叫 1d50:606f）。
+            点击 连接 (断开与主机的连接)。
+            Linux 会立刻加载 gs_usb 驱动。
+
+         2、如果能接服务器
+            把板子的 USB 插到服务器，接好 CAN 线。
+            用 SSH 连进服务器。
+            终端敲 dmesg -w，观察终端输出。
+            当看到类似下面的日志：
+
+            [  123.456789] usb 1-1: new full-speed USB device number 5 using xhci_hcd
+            [  123.567890] gs_usb 1-1:1.0: Configuring for 1 channels...
+            [  123.678901] gs_usb 1-1:1.0: registered as can0
+
+            说明 Linux 已经成功通过 USB 识别到了你的板子。
+            敲 ip link，应该就能看到一个名为 can0 的网络接口。
+
+收发查看：拓展1/2在DMTool软件中通过切换窗口查看；拓展3直接在linux终端中通过命令查看。

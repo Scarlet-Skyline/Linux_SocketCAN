@@ -2,9 +2,7 @@
 #![no_main]
 
 mod board;
-mod dap_usb;
-mod protocol;
-pub mod swd;
+mod gs_usb;
 mod wiring;
 
 use board::Usb;
@@ -14,48 +12,130 @@ use embassy_futures::{
     select::{Either, select},
 };
 //use embassy_stm32::usart::BufferedUart;
-use embassy_stm32::{
-    can::{CanRx, CanTx, frame::FdFrame},
-    usart::BufferedUart,
-};
-//use embassy_time::{Duration, Ticker};
-use embassy_usb::{
-    Builder,
-    class::cdc_acm::{CdcAcmClass, State},
-};
-use embedded_io_async::{Read, Write};
-use panic_halt as _;
-use static_cell::StaticCell;
-use swd::Swd;
+use embassy_stm32::can::{CanRx, CanTx, frame::FdFrame};
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
+
+//use embassy_time::{Duration, Ticker};
+use embassy_usb::{
+    Builder, Handler,
+    control::{InResponse, OutResponse, Request, RequestType},
+    driver::{Driver, Endpoint, EndpointIn, EndpointOut},
+};
+
+use embedded_can::{Frame, Id};
+use panic_halt as _;
+use static_cell::StaticCell;
+
+use gs_usb::{
+    CAN_STARTED, DEVICE_CONFIG, GS_CAN_MODE_RESET, GS_CAN_MODE_START, GS_SFF_MASK,
+    GS_USB_BREQ_BITTIMING, GS_USB_BREQ_BT_CONST, GS_USB_BREQ_DEVICE_CONFIG,
+    GS_USB_BREQ_HOST_FORMAT, GS_USB_BREQ_MODE, GsDeviceBittiming, GsDeviceBtConst, GsDeviceMode,
+    GsHostFrame, NOMINAL_BRP, NOMINAL_SJW, NOMINAL_TSEG1, NOMINAL_TSEG2, bt_const,
+    parse_host_frame, write_host_frame,
+};
+
 const PACKET: usize = 64;
-// Track linker-script changes so Cargo relinks the firmware.
-const _: &[u8] = include_bytes!("../memory.x");
-// use embassy_sync::{
-//     blocking_mutex::raw::CriticalSectionRawMutex,
-//     channel::Channel,
-// };
+
 /// CAN 接收 → 主机发送：容量 8 帧，满时丢弃最旧帧
-static CAN_RX_CHANNEL: Channel<CriticalSectionRawMutex, FdFrame, 8> = Channel::new();
+static CAN_RX_CHANNEL: Channel<CriticalSectionRawMutex, GsHostFrame, 8> = Channel::new();
 
 /// 主机请求 → CAN 发送：容量 4 帧，满时回 ERR BUSY
-static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, FdFrame, 4> = Channel::new();
+static CAN_TX_CHANNEL: Channel<CriticalSectionRawMutex, GsHostFrame, 4> = Channel::new();
+
+/// TX echo → USB IN. Bounded 4.
+static ECHO_CHANNEL: Channel<CriticalSectionRawMutex, GsHostFrame, 4> = Channel::new();
+
+struct GsUsbHandler;
+
+impl Handler for GsUsbHandler {
+    fn control_out(&mut self, req: Request, data: &[u8]) -> Option<OutResponse> {
+        if req.request_type != RequestType::Vendor {
+            return None;
+        }
+        match req.request {
+            GS_USB_BREQ_HOST_FORMAT => Some(OutResponse::Accepted),
+            GS_USB_BREQ_BITTIMING => {
+                if data.len() >= core::mem::size_of::<GsDeviceBittiming>() {
+                    let bt = unsafe {
+                        core::ptr::read_unaligned(data.as_ptr() as *const GsDeviceBittiming)
+                    };
+                    NOMINAL_BRP.store(bt.brp, core::sync::atomic::Ordering::Relaxed);
+                    NOMINAL_TSEG1.store(
+                        bt.prop_seg + bt.phase_seg1,
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                    NOMINAL_TSEG2.store(bt.phase_seg2, core::sync::atomic::Ordering::Relaxed);
+                    NOMINAL_SJW.store(bt.sjw, core::sync::atomic::Ordering::Relaxed);
+                }
+                Some(OutResponse::Accepted)
+            }
+            GS_USB_BREQ_MODE => {
+                if data.len() >= core::mem::size_of::<GsDeviceMode>() {
+                    let m = unsafe { &*(data.as_ptr() as *const GsDeviceMode) };
+                    if m.mode == GS_CAN_MODE_START {
+                        CAN_STARTED.store(true, core::sync::atomic::Ordering::Release);
+                    } else if m.mode == GS_CAN_MODE_RESET {
+                        CAN_STARTED.store(false, core::sync::atomic::Ordering::Release);
+                    }
+                }
+                Some(OutResponse::Accepted)
+            }
+            _ => Some(OutResponse::Accepted),
+        }
+    }
+
+    fn control_in<'a>(&'a mut self, req: Request, data: &'a mut [u8]) -> Option<InResponse<'a>> {
+        if req.request_type != RequestType::Vendor {
+            return None;
+        }
+        match req.request {
+            GS_USB_BREQ_BT_CONST => {
+                let c = bt_const();
+                let n = core::mem::size_of::<GsDeviceBtConst>().min(data.len());
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        &c as *const GsDeviceBtConst as *const u8,
+                        data.as_mut_ptr(),
+                        n,
+                    );
+                }
+                //let slice: &'a [u8] = data;
+                Some(InResponse::Accepted(&data[..n]))
+            }
+            GS_USB_BREQ_DEVICE_CONFIG => {
+                let n = core::mem::size_of::<gs_usb::GsDeviceConfig>().min(data.len());
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        &DEVICE_CONFIG as *const gs_usb::GsDeviceConfig as *const u8,
+                        data.as_mut_ptr(),
+                        n,
+                    );
+                }
+                //let slice: &'a [u8] = data;
+                Some(InResponse::Accepted(&data[..n]))
+            }
+            _ => None,
+        }
+    }
+}
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let (driver, ports, swd) = wiring::configure(board::init());
+    let (driver, ports) = wiring::configure(board::init());
     // Classroom-only test VID/PID, not allocated product identifiers.
-    let mut config = embassy_usb::Config::new(0xC0DE, 0xCAFC);
+    let mut config = embassy_usb::Config::new(0x1d50, 0x606f);
     config.manufacturer = Some("HerKules");
-    config.product = Some("DM-MC02 CMSIS-DAP Demo");
+    config.product = Some("DM-MC02 gs_usb Demo");
+    config.serial_number = Some("0001");
     config.max_packet_size_0 = PACKET as u8;
+
     static DESC: StaticCell<[u8; 256]> = StaticCell::new();
     static MSOS: StaticCell<[u8; 256]> = StaticCell::new();
     static BOS: StaticCell<[u8; 128]> = StaticCell::new();
     static CONTROL: StaticCell<[u8; 64]> = StaticCell::new();
-    static CTL_STATE: StaticCell<State> = StaticCell::new();
-    static UART_STATE: StaticCell<State> = StaticCell::new();
+    static HANDLER: StaticCell<GsUsbHandler> = StaticCell::new();
+
     let mut builder = Builder::new(
         driver,
         config,
@@ -64,114 +144,59 @@ async fn main(_spawner: Spawner) {
         MSOS.init([0; 256]),
         CONTROL.init([0; 64]),
     );
-    builder.msos_descriptor(0x0603_0000, 0x20);
-    let dap = dap_usb::DapUsb::new(&mut builder);
-    let control = CdcAcmClass::new(&mut builder, CTL_STATE.init(State::new()), PACKET as u16);
-    let serial = CdcAcmClass::new(&mut builder, UART_STATE.init(State::new()), PACKET as u16);
+
+    let (ep_out, ep_in) = {
+        let mut function = builder.function(0xff, 0, 0);
+        let mut interface = function.interface();
+        let mut alt = interface.alt_setting(0xff, 0, 0, None);
+        let ep_out = alt.endpoint_bulk_out(None, PACKET as u16);
+        let ep_in = alt.endpoint_bulk_in(None, PACKET as u16);
+        (ep_out, ep_in)
+    };
+    builder.handler(HANDLER.init(GsUsbHandler));
+
     let mut device = builder.build();
     let (can_tx, can_rx, _props) = ports.can.split();
-    // spawner.spawn(can_rx_task(can_rx)).unwrap();
-    // spawner.spawn(can_tx_task(can_tx)).unwrap();
-    // join4(
-    // device.run(),
-    // can_rx_task(can_rx),
-    // can_tx_task(can_tx),
-    // control_port(control, swd),
-    // // 如果要保留 UART 透传，可以用 join5，把 uart_port 也放进来
-    // );
-    join(
-        join4(
-            device.run(),
-            control_port(control, swd),
-            uart_port(serial, ports.uart),
-            dap.run(),
-        ),
+
+    join4(
+        device.run(),
+        usb_rx_task(ep_out),
+        usb_tx_task(ep_in),
         join(can_rx_task(can_rx), can_tx_task(can_tx)),
     )
     .await;
 }
 
-async fn control_port(
-    mut usb: CdcAcmClass<'static, Usb>,
-    //mut can: Can<'static>,
-    mut swd: Option<Swd>,
-) {
-    let mut packet = [0; PACKET];
-    //let mut ticker = Ticker::every(Duration::from_millis(500)); // 每 500ms 触发一次
+//#[embassy_executor::task]
+async fn usb_rx_task(mut ep_out: <Usb as Driver<'static>>::EndpointOut) {
+    let mut buf = [0u8; PACKET];
     loop {
-        usb.wait_connection().await;
-        let mut line = protocol::Line::new();
-
-        loop {
-            let read_usb = async { usb.read_packet(&mut packet).await.ok() };
-            let read_can = async { CAN_RX_CHANNEL.receive().await };
-
-            match select(read_usb, read_can).await {
-                // 1. 收到来自主机的 USB 数据
-                Either::First(Some(n)) => {
-                    for &byte in &packet[..n] {
-                        if let Some(command) = line.push(byte) {
-                            match protocol::execute(command, &mut swd).await {
-                                protocol::Action::Reply(reply) => {
-                                    if usb.write_packet(reply.as_bytes()).await.is_err() {
-                                        break; // USB断连
-                                    }
-                                }
-                                protocol::Action::SendCan(frame) => {
-                                    match CAN_TX_CHANNEL.try_send(frame) {
-                                        Ok(()) => {
-                                            let _ = usb.write_packet(b"OK QUEUED\n").await;
-                                        }
-                                        Err(_) => {
-                                            let _ = usb.write_packet(b"ERR BUSY\n").await;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+        ep_out.wait_enabled().await;
+        if let Ok(n) = ep_out.read(&mut buf).await {
+            if let Some(frame) = parse_host_frame(&buf[..n]) {
+                // 基础任务只支持标准数据帧
+                if frame.can_id & gs_usb::GS_EFF_FLAG != 0 {
+                    continue;
                 }
-                // 2. USB 读取错误或断开
-                Either::First(None) => break,
-                // 3. 收到来自 CAN 的帧，主动推送给主机
-                Either::Second(frame) => {
-                    let text = protocol::format_rx(&frame);
-                    if usb.write_packet(text.as_bytes()).await.is_err() {
-                        break;
-                    }
-                }
+                let _ = CAN_TX_CHANNEL.try_send(frame);
             }
         }
     }
 }
 
 //#[embassy_executor::task]
-async fn can_rx_task(mut rx: CanRx<'static>) {
+async fn usb_tx_task(mut ep_in: <Usb as Driver<'static>>::EndpointIn) {
     loop {
-        let envelope = match rx.read_fd().await {
-            Ok(e) => e,
-            Err(_) => continue, // 总线错误，继续接收
+        ep_in.wait_enabled().await;
+        let frame = match select(CAN_RX_CHANNEL.receive(), ECHO_CHANNEL.receive()).await {
+            Either::First(f) => f,
+            Either::Second(f) => f,
         };
-        let frame = envelope.frame;
-
-        // 有界缓冲：满时丢弃最旧帧，保证 CAN 接收不被阻塞
-        let _ = CAN_RX_CHANNEL.try_send(frame);
-    }
-}
-
-//#[embassy_executor::task]
-async fn can_tx_task(mut tx: CanTx<'static>) {
-    loop {
-        let frame = CAN_TX_CHANNEL.receive().await;
-        // 用 try_write 非阻塞发送；队列满时短暂等待后重试
-        let _ = tx.write_fd(&frame).await;
-        //embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
-        // match CAN_TX_CHANNEL.try_send(frame) {
-        //     Ok(_) => break,
-        //     Err(_) => {
-        //         embassy_time::Timer::after(embassy_time::Duration::from_millis(1)).await;
-        //     }
-        // }
+        let mut buf = [0u8; PACKET];
+        let n = write_host_frame(&frame, &mut buf);
+        if n > 0 {
+            let _ = ep_in.write(&buf[..n]).await;
+        }
     }
 }
 
@@ -183,31 +208,48 @@ async fn can_tx_task(mut tx: CanTx<'static>) {
 //     }
 // }
 
-async fn uart_port(usb: CdcAcmClass<'static, Usb>, uart: Option<BufferedUart<'static>>) {
-    let Some(uart) = uart else {
-        return;
-    };
-    let (mut serial_out, mut serial_in) = uart.split();
-    let (mut usb_out, mut usb_in) = usb.split();
+/// FDCAN RX → CAN RX queue.
+async fn can_rx_task(mut rx: CanRx<'static>) {
     loop {
-        usb_in.wait_connection().await;
-        let from_host = async {
-            let mut buf = [0; PACKET];
-            while let Ok(n) = usb_in.read_packet(&mut buf).await {
-                if serial_out.write_all(&buf[..n]).await.is_err() {
-                    break;
-                }
-            }
+        let envelope = match rx.read_fd().await {
+            Ok(e) => e,
+            Err(_) => continue,
         };
-        let to_host = async {
-            // A short packet needs no zero-length terminator.
-            let mut buf = [0; PACKET - 1];
-            while let Ok(n) = serial_in.read(&mut buf).await {
-                if n != 0 && usb_out.write_packet(&buf[..n]).await.is_err() {
-                    break;
-                }
+        if !CAN_STARTED.load(core::sync::atomic::Ordering::Acquire) {
+            continue;
+        }
+        let frame = envelope.frame;
+        let mut gs = GsHostFrame::empty_rx();
+        match frame.id() {
+            Id::Standard(id) => {
+                gs.can_id = id.as_raw() as u32 & GS_SFF_MASK;
             }
-        };
-        select(from_host, to_host).await;
+            Id::Extended(_) => continue,
+        }
+        if frame.is_remote_frame() {
+            continue;
+        }
+        let data = frame.data();
+        let len = data.len().min(8);
+        gs.can_dlc = len as u8;
+        gs.data[..len].copy_from_slice(&data[..len]);
+        let _ = CAN_RX_CHANNEL.try_send(gs);
+    }
+}
+
+/// CAN TX queue → FDCAN, then echo back on USB with original echo_id.
+async fn can_tx_task(mut tx: CanTx<'static>) {
+    loop {
+        let gs = CAN_TX_CHANNEL.receive().await;
+        if !CAN_STARTED.load(core::sync::atomic::Ordering::Acquire) {
+            continue;
+        }
+        let len = (gs.can_dlc as usize).min(8);
+        let id = (gs.can_id & GS_SFF_MASK) as u16;
+        if let Ok(frame) = FdFrame::new_standard(id, &gs.data[..len]) {
+            if tx.write_fd(&frame).await.is_some() {
+                let _ = ECHO_CHANNEL.try_send(gs);
+            }
+        }
     }
 }
